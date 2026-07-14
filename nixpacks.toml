@@ -1,9 +1,2 @@
 [phases.setup]
 aptPkgs = ["libgl1", "libglib2.0-0"]
-
-[phases.install]
-cmds = [
-  "pip install -r requirements.txt",
-  "pip uninstall -y opencv-python opencv-python-headless",
-  "pip install opencv-python-headless"
-]
