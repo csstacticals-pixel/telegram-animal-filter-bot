@@ -34,10 +34,10 @@ BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "PASTE_YOUR_BOT_TOKEN_HERE")
 # YOLOv8 model. "yolov8n.pt" (nano) is fastest and downloads automatically on
 # first run. Use "yolov8s.pt" or "yolov8m.pt" for better accuracy if your
 # server has more CPU/GPU headroom.
-MODEL_NAME = "yolov8n.pt"
+MODEL_NAME = "yolov8s.pt"
 
 # Minimum confidence to trust a detection.
-CONFIDENCE_THRESHOLD = 0.45
+CONFIDENCE_THRESHOLD = 0.3
 
 # Classes (from the COCO dataset, which YOLOv8 is trained on) that mean
 # "keep this image" if detected.
@@ -55,7 +55,7 @@ ANIMAL_CLASSES = {
 # (e.g. blurry photo, landscape, object detector unsure), should we keep
 # or delete? Recommended: keep (safer — avoids deleting something the
 # model just failed to recognize).
-KEEP_ON_UNCERTAIN = True
+KEEP_ON_UNCERTAIN = False
 
 # ---------------------------------------------------------------------------
 
