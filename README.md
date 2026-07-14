@@ -12,6 +12,9 @@ detection, running in polling mode (no public server/SSL required).
 - `railway.json` — Railway build/deploy config (auto-restart on crash, etc.)
 - `.python-version` — pins the Python version Railway builds with
 - `.gitignore` — keeps venv/cache/model files out of your repo
+- `nixpacks.toml` — installs system libraries (`libgl1`, `libglib2.0-0`) that
+  `opencv`/`ultralytics` need but aren't present on Railway's base image by
+  default (without this, the deploy crashes with `ImportError: libGL.so.1`)
 
 ## 1. Create the bot on Telegram
 
