@@ -27,17 +27,6 @@ joined, so this only affects new photos posted after the bot is added.
 
 Run mode: polling (no public URL/SSL needed — just run this script on a
 server or your own machine and leave it running).
-
---- IMPORTANT NOTE ON THIS VERSION ---
-The MegaDetector/PytorchWildlife integration below is built from Microsoft's
-official PyPI README and model-zoo docs, but their documentation site is
-JavaScript-rendered so I could not confirm every exact detail of the
-single_image_detection() return format from here. The result-parsing code
-is written defensively (tries several plausible shapes and logs clearly if
-none match) specifically so that if the exact format differs, the very
-first deploy log will show us precisely what to adjust — the same pattern
-we used to fix the earlier OpenCV/libGL issue on Railway. Expect to send me
-the first deploy log after this change so we can confirm/adjust quickly.
 """
 
 import asyncio
@@ -62,9 +51,7 @@ BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "PASTE_YOUR_BOT_TOKEN_HERE")
 
 # MegaDetectorV6 version. "MDV6-yolov10-c" is the smallest/fastest variant
 # (2.3M params, no NMS post-processing step) — chosen here to keep
-# per-photo processing quick. If detection quality isn't good enough,
-# "MDV6-yolov10-e" (29.5M params) trades speed for meaningfully higher
-# accuracy — see https://microsoft.github.io/CameraTraps/model_zoo/megadetector/
+# per-photo processing quick.
 MEGADETECTOR_VERSION = "MDV6-yolov10-c"
 
 # Minimum confidence to trust a detection.
@@ -76,29 +63,14 @@ CONFIDENCE_THRESHOLD = 0.25
 KEEP_ON_UNCERTAIN = False
 
 # --- Image enhancement (for detection accuracy only) ------------------------
-# Camera-trap footage is often low-contrast, hazy, or dim (dawn/dusk/night).
-# When enabled, each photo is enhanced in memory before being handed to the
-# detector — the photo left in the chat is untouched.
 ENHANCE_IMAGES = True
-
-# Denoising (on top of contrast correction) further helps grainy/noisy night
-# shots, but is noticeably slower per photo. Off by default.
 ENHANCE_DENOISE = False
 
 # --- Multi-frame burst confirmation -----------------------------------------
-# Cameras here send photos in short bursts per motion event (commonly 2
-# images). Rather than deciding on each photo alone, the bot groups photos
-# from the same chat that arrive close together and decides for the whole
-# group at once: if ANY frame in the burst shows a person/vehicle, the whole
-# burst is kept.
 BURST_WINDOW_SECONDS = 4.0
 MAX_BURST_SIZE = 2
 
 # --- Health check -----------------------------------------------------------
-# Posts a short "still running" message to a chat every N hours. Defaults to
-# the same group the bot already monitors (seen in deploy logs as chat
-# -1002504583469). Override via HEALTH_CHECK_CHAT_ID, or set it to an empty
-# string to disable.
 _health_check_chat_id_raw = os.environ.get("HEALTH_CHECK_CHAT_ID", "-1002504583469")
 HEALTH_CHECK_CHAT_ID = int(_health_check_chat_id_raw) if _health_check_chat_id_raw else None
 HEALTH_CHECK_INTERVAL_SECONDS = 6 * 60 * 60  # every 6 hours
@@ -115,31 +87,23 @@ logger = logging.getLogger("animal-filter-bot")
 logger.info("Loading MegaDetectorV6 (%s)...", MEGADETECTOR_VERSION)
 detector = pw_detection.MegaDetectorV6(version=MEGADETECTOR_VERSION)
 
-# MegaDetector's fixed taxonomy. PytorchWildlife typically exposes this as
-# detector.CLASS_NAMES; falling back to the documented default order
-# (0=animal, 1=person, 2=vehicle) if that attribute isn't present under
-# this version, so a mismatch here is easy to spot and fix from the logs.
 CLASS_NAMES = getattr(detector, "CLASS_NAMES", {0: "animal", 1: "person", 2: "vehicle"})
 logger.info("MegaDetector class map: %s", CLASS_NAMES)
 
 KEEP_LABELS = {"person", "vehicle"}
 ANIMAL_LABELS = {"animal"}
 
-# Single background worker thread for detector inference — frees the asyncio
-# event loop to keep handling other photos while inference runs.
 _inference_executor = ThreadPoolExecutor(max_workers=1)
 
-# Per-chat burst buffers: chat_id -> {"items": [(msg_id, decision), ...], "timer": asyncio.Task}
 _pending_bursts: dict = {}
 _pending_lock = asyncio.Lock()
 
 
 def enhance_image(image_path: str):
     """
-    Loads the image and applies CLAHE (contrast-limited adaptive histogram
-    equalization) to correct low-contrast/dim shots. Returns a numpy array
-    (BGR) on success, or the original path on failure so detection can
-    still fall back to reading the file directly.
+    Loads the image and applies CLAHE to correct low-contrast/dim shots.
+    Returns a numpy array (BGR, uint8) on success, or the original path on
+    failure so detection can still fall back to reading the file directly.
     """
     img = cv2.imread(image_path)
     if img is None:
@@ -161,14 +125,6 @@ def enhance_image(image_path: str):
 
 
 def _extract_detections(result):
-    """
-    Defensively pulls (label, confidence) pairs out of whatever shape
-    single_image_detection() returns. Tries the documented "detections"
-    object (supervision.Detections-style, with .class_id / .confidence
-    arrays) first, then falls back to a couple of other plausible shapes.
-    Logs the raw result once if nothing matches, so we can see exactly
-    what came back and adjust quickly.
-    """
     pairs = []
 
     detections = None
@@ -186,7 +142,6 @@ def _extract_detections(result):
                 pairs.append((label, float(conf)))
             return pairs
 
-    # Fallback: a list of dicts each with e.g. "category"/"label" and "conf"/"confidence".
     if isinstance(result, dict) and "detections" in result and isinstance(result["detections"], list):
         for det in result["detections"]:
             label = det.get("label") or det.get("category") or det.get("class")
@@ -198,8 +153,7 @@ def _extract_detections(result):
 
     logger.warning(
         "Could not parse MegaDetector result into (label, confidence) pairs — "
-        "raw result: %r. Detection will be treated as 'uncertain' until this "
-        "is fixed; send this log line so the parsing can be corrected.",
+        "raw result: %r.",
         result,
     )
     return pairs
@@ -222,11 +176,12 @@ def classify_image(image_path: str) -> str:
             return "uncertain"
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
 
-    # PytorchWildlife's quick-start example passes a channels-first
-    # (3, H, W) array — matching that shape here.
-    img_chw = np.transpose(img_rgb, (2, 0, 1))
-
-    result = detector.single_image_detection(img_chw)
+    # Pass the array in standard (height, width, channels) order — this is
+    # an Ultralytics-backed model under the hood, which expects HWC, not
+    # the channels-first (3, H, W) shape shown in PytorchWildlife's
+    # smoke-test demo snippet. Passing CHW here previously caused the model
+    # to see scrambled pixel data and return zero detections on everything.
+    result = detector.single_image_detection(img_rgb)
     detections = _extract_detections(result)
 
     found_keep = False
