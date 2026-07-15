@@ -3,6 +3,8 @@ Telegram Animal-Image Filter Bot
 ---------------------------------
 Watches a Telegram group/channel it's an admin of. When a photo is posted:
   - Runs it through a YOLOv8 object detector.
+  - Replies to the photo tagging what was detected (person, car, dog, etc.)
+    — see TAG_IMAGES below to toggle this off.
   - If a "person" or vehicle (car/truck/bus/motorcycle/bicycle) is detected -> KEEP.
   - If only animal classes are detected (no person/vehicle) -> DELETE.
   - If nothing relevant is detected at all (empty/unclear result) -> see
@@ -64,6 +66,12 @@ ANIMAL_CLASSES = {
 # setting, since it no longer defaults to the safe "keep" behavior.
 KEEP_ON_UNCERTAIN = False
 
+# If True, the bot replies to every incoming photo with a short tag listing
+# everything it detected (e.g. "Detected: person, dog") before acting on it.
+# Useful for visibility/debugging — turn off if you'd rather the chat stay
+# quiet and only see photos actually get removed.
+TAG_IMAGES = True
+
 # ---------------------------------------------------------------------------
 
 logging.basicConfig(
@@ -76,9 +84,12 @@ logger.info("Loading YOLO model (%s)...", MODEL_NAME)
 model = YOLO(MODEL_NAME)
 
 
-def classify_image(image_path: str) -> str:
+def classify_image(image_path: str):
     """
-    Returns one of: "keep", "delete", "uncertain"
+    Returns a tuple: (decision, detected_labels)
+      - decision is one of: "keep", "delete", "uncertain"
+      - detected_labels is a sorted list of every class name detected above
+        the confidence threshold (not just keep/animal classes), for tagging.
     """
     # imgsz=1280 (up from the default 640) runs inference at higher resolution,
     # which meaningfully helps detect small/distant subjects — common in wide
@@ -88,6 +99,7 @@ def classify_image(image_path: str) -> str:
 
     found_keep = False
     found_animal = False
+    detected_labels = set()
 
     for box in results.boxes:
         conf = float(box.conf[0])
@@ -95,6 +107,7 @@ def classify_image(image_path: str) -> str:
             continue
         cls_id = int(box.cls[0])
         cls_name = model.names[cls_id]
+        detected_labels.add(cls_name)
 
         if cls_name in KEEP_CLASSES:
             found_keep = True
@@ -102,10 +115,13 @@ def classify_image(image_path: str) -> str:
             found_animal = True
 
     if found_keep:
-        return "keep"
-    if found_animal:
-        return "delete"
-    return "uncertain"
+        decision = "keep"
+    elif found_animal:
+        decision = "delete"
+    else:
+        decision = "uncertain"
+
+    return decision, sorted(detected_labels)
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -119,10 +135,24 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     with tempfile.NamedTemporaryFile(suffix=".jpg", delete=True) as tmp:
         await file.download_to_drive(tmp.name)
-        decision = classify_image(tmp.name)
+        decision, detected_labels = classify_image(tmp.name)
 
     chat_id = message.chat_id
     msg_id = message.message_id
+
+    # Tag the photo with what was detected, before any deletion happens
+    # (replying to a message after it's deleted would fail).
+    if TAG_IMAGES:
+        if detected_labels:
+            tag_text = f"Detected: {', '.join(detected_labels)}"
+        else:
+            tag_text = "Detected: nothing recognizable"
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id, text=tag_text, reply_to_message_id=msg_id
+            )
+        except Exception as exc:
+            logger.warning("Failed to send tag for msg %s: %s", msg_id, exc)
 
     if decision == "delete":
         try:
