@@ -5,8 +5,8 @@ Watches a Telegram group/channel it's an admin of. When a photo is posted:
   - Runs it through a YOLOv8 object detector.
   - If a "person" or vehicle (car/truck/bus/motorcycle/bicycle) is detected -> KEEP.
   - If only animal classes are detected (no person/vehicle) -> DELETE.
-  - If nothing relevant is detected at all (empty/unclear result) -> KEEP by default
-    (safer than risking deletion of a non-animal photo; see KEEP_ON_UNCERTAIN below).
+  - If nothing relevant is detected at all (empty/unclear result) -> see
+    KEEP_ON_UNCERTAIN below for how that's handled.
 
 Requires the bot to be added as an ADMIN with "Delete Messages" permission in the
 target chat. Telegram bots cannot read message history from before they joined,
@@ -80,7 +80,11 @@ def classify_image(image_path: str) -> str:
     """
     Returns one of: "keep", "delete", "uncertain"
     """
-    results = model(image_path, verbose=False)[0]
+    # imgsz=1280 (up from the default 640) runs inference at higher resolution,
+    # which meaningfully helps detect small/distant subjects — common in wide
+    # fisheye or wildlife-camera shots where the animals occupy few pixels.
+    # Slightly slower per image, but still fast enough for single-photo use.
+    results = model(image_path, imgsz=1280, verbose=False)[0]
 
     found_keep = False
     found_animal = False
