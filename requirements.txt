@@ -1,4 +1,3 @@
 python-telegram-bot[job-queue]==21.4
 PytorchWildlife==1.3.0
-opencv-python-headless
 numpy
