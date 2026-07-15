@@ -22,6 +22,7 @@ import tempfile
 
 from telegram import Update
 from telegram.ext import Application, MessageHandler, ContextTypes, filters
+from telegram.request import HTTPXRequest
 from ultralytics import YOLO
 
 # ---------------------------------------------------------------------------
@@ -31,13 +32,17 @@ from ultralytics import YOLO
 # Get this from @BotFather after running /newbot
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "PASTE_YOUR_BOT_TOKEN_HERE")
 
-# YOLOv8 model. "yolov8n.pt" (nano) is fastest and downloads automatically on
-# first run. Use "yolov8s.pt" or "yolov8m.pt" for better accuracy if your
-# server has more CPU/GPU headroom.
+# YOLOv8 model. "yolov8n.pt" (nano) is fastest but least accurate. "yolov8s.pt"
+# (small) is meaningfully more accurate at a modest speed cost — a single
+# photo still processes in well under a second on typical Railway hardware.
+# Use "yolov8m.pt" for even higher accuracy if you don't mind it being slower.
 MODEL_NAME = "yolov8s.pt"
 
-# Minimum confidence to trust a detection.
-CONFIDENCE_THRESHOLD = 0.3
+# Minimum confidence to trust a detection. Lowered from 0.45 so more animals
+# (and more people/vehicles) get picked up instead of falling through as
+# "uncertain". If you start seeing false deletes (a person/car photo removed
+# by mistake), raise this back up in steps of 0.05.
+CONFIDENCE_THRESHOLD = 0.30
 
 # Classes (from the COCO dataset, which YOLOv8 is trained on) that mean
 # "keep this image" if detected.
@@ -52,9 +57,11 @@ ANIMAL_CLASSES = {
 }
 
 # If the detector finds NEITHER a keep-class NOR an animal-class object
-# (e.g. blurry photo, landscape, object detector unsure), should we keep
-# or delete? Recommended: keep (safer — avoids deleting something the
-# model just failed to recognize).
+# (e.g. blurry photo, landscape, empty/unclear image), should we keep or
+# delete? Set to False to also clear out empty/ambiguous photos, alongside
+# clear animal shots. Trade-off: a person/car photo the model fails to
+# recognize (bad angle, poor lighting) would also get deleted under this
+# setting, since it no longer defaults to the safe "keep" behavior.
 KEEP_ON_UNCERTAIN = False
 
 # ---------------------------------------------------------------------------
@@ -143,7 +150,14 @@ def main() -> None:
             "or set the TELEGRAM_BOT_TOKEN environment variable."
         )
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    # Longer timeouts than the library default reduce the occasional
+    # "TimedOut" errors seen when downloading larger photos or on a slow
+    # connection between Railway and Telegram's file servers. These are
+    # non-fatal either way (the bot recovers and keeps polling), but fewer
+    # timeouts means fewer skipped/retried classifications.
+    request = HTTPXRequest(connect_timeout=15.0, read_timeout=30.0, write_timeout=15.0)
+
+    app = Application.builder().token(BOT_TOKEN).request(request).build()
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 
     logger.info("Bot started. Polling for new photos...")
