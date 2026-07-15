@@ -1,30 +1,43 @@
 """
-Telegram Animal-Image Filter Bot
----------------------------------
+Telegram Animal-Image Filter Bot — MegaDetector edition
+--------------------------------------------------------
 Watches a Telegram group/channel it's an admin of. When a photo is posted:
   - Enhances the image internally (contrast/low-light correction) to help
     the detector, without altering the photo actually left in the chat.
-  - Runs it through a YOLOv8 object detector (in a background thread, so it
-    never blocks the bot from handling other incoming photos concurrently).
+  - Runs it through MegaDetectorV6 (PytorchWildlife) — a detector built
+    specifically for camera-trap imagery, with a generic 3-class taxonomy:
+    animal / person / vehicle. Unlike a general COCO model, it doesn't need
+    to recognize specific species (oryx, springbok, kudu, etc.) — anything
+    non-human/non-vehicle just falls under "animal".
+  - Runs inference in a background thread (never blocks the bot from
+    handling other incoming photos concurrently).
   - Buffers photos that arrive close together into a "burst" (cameras here
     typically send 2 images per motion event) and waits briefly for the
     rest of the burst before acting — see BURST_WINDOW_SECONDS/MAX_BURST_SIZE.
   - If ANY photo in a burst shows a person or vehicle -> the WHOLE burst is
-    kept. This favors recall: a single frame catching an intrusion is enough
-    to preserve the full event, even if a companion frame in the same burst
-    missed it.
-  - If NO photo in the burst shows a person/vehicle (animal-only or
-    unclear) -> each photo in the burst is deleted per KEEP_ON_UNCERTAIN.
+    kept. If NO photo in the burst shows a person/vehicle -> every photo in
+    the burst is deleted.
 
 No tagging/reply messages are sent — the bot only acts silently (deletes or
 leaves photos alone), aside from the periodic health-check heartbeat.
 
-Requires the bot to be added as an ADMIN with "Delete Messages" permission in the
-target chat. Telegram bots cannot read message history from before they joined,
-so this only affects new photos posted after the bot is added and running.
+Requires the bot to be added as an ADMIN with "Delete Messages" permission in
+the target chat. Telegram bots cannot read message history from before they
+joined, so this only affects new photos posted after the bot is added.
 
-Run mode: polling (no public URL/SSL needed — just run this script on a server
-or your own machine and leave it running).
+Run mode: polling (no public URL/SSL needed — just run this script on a
+server or your own machine and leave it running).
+
+--- IMPORTANT NOTE ON THIS VERSION ---
+The MegaDetector/PytorchWildlife integration below is built from Microsoft's
+official PyPI README and model-zoo docs, but their documentation site is
+JavaScript-rendered so I could not confirm every exact detail of the
+single_image_detection() return format from here. The result-parsing code
+is written defensively (tries several plausible shapes and logs clearly if
+none match) specifically so that if the exact format differs, the very
+first deploy log will show us precisely what to adjust — the same pattern
+we used to fix the earlier OpenCV/libGL issue on Railway. Expect to send me
+the first deploy log after this change so we can confirm/adjust quickly.
 """
 
 import asyncio
@@ -38,7 +51,7 @@ import numpy as np
 from telegram import Update
 from telegram.ext import Application, MessageHandler, ContextTypes, filters
 from telegram.request import HTTPXRequest
-from ultralytics import YOLO
+from PytorchWildlife.models import detection as pw_detection
 
 # ---------------------------------------------------------------------------
 # CONFIG — edit these before running
@@ -47,47 +60,29 @@ from ultralytics import YOLO
 # Get this from @BotFather after running /newbot
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "PASTE_YOUR_BOT_TOKEN_HERE")
 
-# YOLOv8 model. This is a security/intrusion-monitoring use case, so accuracy
-# is weighted higher than raw speed. Using the large model for maximum
-# detection accuracy.
-#   yolov8n.pt - fastest, least accurate
-#   yolov8s.pt - good balance
-#   yolov8m.pt - noticeably more accurate
-#   yolov8l.pt - highest accuracy of this set  <- current
-MODEL_NAME = "yolov8l.pt"
+# MegaDetectorV6 version. "MDV6-yolov10-c" is the smallest/fastest variant
+# (2.3M params, no NMS post-processing step) — chosen here to keep
+# per-photo processing quick. If detection quality isn't good enough,
+# "MDV6-yolov10-e" (29.5M params) trades speed for meaningfully higher
+# accuracy — see https://microsoft.github.io/CameraTraps/model_zoo/megadetector/
+MEGADETECTOR_VERSION = "MDV6-yolov10-c"
 
-# Minimum confidence to trust a detection. Kept low so weaker/partial/distant
-# detections (common in wide fisheye or wildlife-camera shots) still count.
+# Minimum confidence to trust a detection.
 CONFIDENCE_THRESHOLD = 0.25
 
-# Classes (from the COCO dataset, which YOLOv8 is trained on) that mean
-# "keep this image" if detected.
-KEEP_CLASSES = {"person", "car", "truck", "bus", "motorcycle", "bicycle"}
-
-# Classes that count as "animal" for the delete decision — anything that
-# isn't in KEEP_CLASSES is treated as a candidate for deletion as long as at
-# least one animal was found.
-ANIMAL_CLASSES = {
-    "bird", "cat", "dog", "horse", "sheep", "cow", "elephant",
-    "bear", "zebra", "giraffe",
-}
-
-# If a single photo finds NEITHER a keep-class NOR an animal-class object
-# (blurry, empty, unclear), should it count as delete-eligible? False = also
-# delete empty/ambiguous photos alongside clear animal shots.
+# If a photo finds NEITHER a person/vehicle NOR an animal (blurry, empty,
+# unclear), should it count as delete-eligible? False = also delete
+# empty/ambiguous photos alongside clear animal shots.
 KEEP_ON_UNCERTAIN = False
 
 # --- Image enhancement (for detection accuracy only) ------------------------
 # Camera-trap footage is often low-contrast, hazy, or dim (dawn/dusk/night).
-# When enabled, each photo is enhanced in memory before being handed to YOLO
-# — the photo left in the chat is untouched; only the copy used for detection
-# is enhanced.
+# When enabled, each photo is enhanced in memory before being handed to the
+# detector — the photo left in the chat is untouched.
 ENHANCE_IMAGES = True
 
 # Denoising (on top of contrast correction) further helps grainy/noisy night
-# shots, but is noticeably slower per photo. Off by default; turn on if
-# you're specifically missing detections in noisy/night footage and can
-# afford the extra processing time.
+# shots, but is noticeably slower per photo. Off by default.
 ENHANCE_DENOISE = False
 
 # --- Multi-frame burst confirmation -----------------------------------------
@@ -95,28 +90,15 @@ ENHANCE_DENOISE = False
 # images). Rather than deciding on each photo alone, the bot groups photos
 # from the same chat that arrive close together and decides for the whole
 # group at once: if ANY frame in the burst shows a person/vehicle, the whole
-# burst is kept — reducing the chance a real intrusion is lost just because
-# one of several frames missed the detection.
-
-# How long to wait after the last photo in a chat before finalizing the
-# burst (in case a companion frame is still on its way).
+# burst is kept.
 BURST_WINDOW_SECONDS = 4.0
-
-# Finalize immediately once this many photos have arrived for a chat,
-# without waiting for the full window — matches cameras that reliably send
-# exactly 2 images per event.
 MAX_BURST_SIZE = 2
 
 # --- Health check -----------------------------------------------------------
-# Posts a short "still running" message to a chat every N hours, so rangers
-# have a quick way to notice if the bot has silently stopped working (e.g.
-# stalled/crashed container) rather than only finding out when a real
-# intrusion photo doesn't get filtered.
-#
-# Defaults to the same group the bot already monitors (seen in deploy logs
-# as chat -1002504583469). Override via the HEALTH_CHECK_CHAT_ID environment
-# variable if you ever want the heartbeat posted somewhere else instead, or
-# set it to an empty string to disable the health check entirely.
+# Posts a short "still running" message to a chat every N hours. Defaults to
+# the same group the bot already monitors (seen in deploy logs as chat
+# -1002504583469). Override via HEALTH_CHECK_CHAT_ID, or set it to an empty
+# string to disable.
 _health_check_chat_id_raw = os.environ.get("HEALTH_CHECK_CHAT_ID", "-1002504583469")
 HEALTH_CHECK_CHAT_ID = int(_health_check_chat_id_raw) if _health_check_chat_id_raw else None
 HEALTH_CHECK_INTERVAL_SECONDS = 6 * 60 * 60  # every 6 hours
@@ -130,16 +112,21 @@ logging.basicConfig(
 )
 logger = logging.getLogger("animal-filter-bot")
 
-logger.info("Loading YOLO model (%s)...", MODEL_NAME)
-model = YOLO(MODEL_NAME)
+logger.info("Loading MegaDetectorV6 (%s)...", MEGADETECTOR_VERSION)
+detector = pw_detection.MegaDetectorV6(version=MEGADETECTOR_VERSION)
 
-# Single background worker thread for YOLO inference. Inference is CPU-bound
-# and would otherwise block the asyncio event loop (and every other Telegram
-# update) for the duration of each call. Running it in an executor frees the
-# event loop to keep downloading/handling other photos concurrently while
-# inference happens in the background. max_workers=1 keeps inference calls
-# serialized (simplest/safest for a single YOLO model instance) while still
-# unblocking the event loop.
+# MegaDetector's fixed taxonomy. PytorchWildlife typically exposes this as
+# detector.CLASS_NAMES; falling back to the documented default order
+# (0=animal, 1=person, 2=vehicle) if that attribute isn't present under
+# this version, so a mismatch here is easy to spot and fix from the logs.
+CLASS_NAMES = getattr(detector, "CLASS_NAMES", {0: "animal", 1: "person", 2: "vehicle"})
+logger.info("MegaDetector class map: %s", CLASS_NAMES)
+
+KEEP_LABELS = {"person", "vehicle"}
+ANIMAL_LABELS = {"animal"}
+
+# Single background worker thread for detector inference — frees the asyncio
+# event loop to keep handling other photos while inference runs.
 _inference_executor = ThreadPoolExecutor(max_workers=1)
 
 # Per-chat burst buffers: chat_id -> {"items": [(msg_id, decision), ...], "timer": asyncio.Task}
@@ -147,20 +134,15 @@ _pending_bursts: dict = {}
 _pending_lock = asyncio.Lock()
 
 
-def enhance_image(image_path: str) -> np.ndarray:
+def enhance_image(image_path: str):
     """
     Loads the image and applies CLAHE (contrast-limited adaptive histogram
-    equalization) on the luminance channel to correct for low-contrast,
-    hazy, or dim (dawn/dusk/night) shots — helps YOLO pick out subjects that
-    would otherwise blend into a washed-out or dark background. Optionally
-    denoises on top of that if ENHANCE_DENOISE is on.
-
-    Returns a numpy array (BGR) — YOLO accepts arrays directly, no need to
-    write the enhanced version back to disk.
+    equalization) to correct low-contrast/dim shots. Returns a numpy array
+    (BGR) on success, or the original path on failure so detection can
+    still fall back to reading the file directly.
     """
     img = cv2.imread(image_path)
     if img is None:
-        # Fall back to letting YOLO read the original file directly.
         return image_path
 
     lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
@@ -178,6 +160,51 @@ def enhance_image(image_path: str) -> np.ndarray:
     return enhanced
 
 
+def _extract_detections(result):
+    """
+    Defensively pulls (label, confidence) pairs out of whatever shape
+    single_image_detection() returns. Tries the documented "detections"
+    object (supervision.Detections-style, with .class_id / .confidence
+    arrays) first, then falls back to a couple of other plausible shapes.
+    Logs the raw result once if nothing matches, so we can see exactly
+    what came back and adjust quickly.
+    """
+    pairs = []
+
+    detections = None
+    if isinstance(result, dict):
+        detections = result.get("detections")
+    else:
+        detections = getattr(result, "detections", None)
+
+    if detections is not None:
+        class_ids = getattr(detections, "class_id", None)
+        confidences = getattr(detections, "confidence", None)
+        if class_ids is not None and confidences is not None:
+            for cls_id, conf in zip(class_ids, confidences):
+                label = CLASS_NAMES.get(int(cls_id), str(cls_id))
+                pairs.append((label, float(conf)))
+            return pairs
+
+    # Fallback: a list of dicts each with e.g. "category"/"label" and "conf"/"confidence".
+    if isinstance(result, dict) and "detections" in result and isinstance(result["detections"], list):
+        for det in result["detections"]:
+            label = det.get("label") or det.get("category") or det.get("class")
+            conf = det.get("confidence", det.get("conf", 0.0))
+            if label is not None:
+                pairs.append((str(label), float(conf)))
+        if pairs:
+            return pairs
+
+    logger.warning(
+        "Could not parse MegaDetector result into (label, confidence) pairs — "
+        "raw result: %r. Detection will be treated as 'uncertain' until this "
+        "is fixed; send this log line so the parsing can be corrected.",
+        result,
+    )
+    return pairs
+
+
 def classify_image(image_path: str) -> str:
     """
     Synchronous, CPU-bound. Returns one of: "keep", "delete", "uncertain".
@@ -186,23 +213,30 @@ def classify_image(image_path: str) -> str:
     """
     detection_input = enhance_image(image_path) if ENHANCE_IMAGES else image_path
 
-    # imgsz=1280 (up from the default 640) runs inference at higher resolution,
-    # which meaningfully helps detect small/distant subjects.
-    results = model(detection_input, imgsz=1280, verbose=False)[0]
+    if isinstance(detection_input, np.ndarray):
+        img_rgb = cv2.cvtColor(detection_input, cv2.COLOR_BGR2RGB)
+    else:
+        img_bgr = cv2.imread(detection_input)
+        if img_bgr is None:
+            logger.warning("Could not read image for detection: %s", detection_input)
+            return "uncertain"
+        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+
+    # PytorchWildlife's quick-start example passes a channels-first
+    # (3, H, W) array — matching that shape here.
+    img_chw = np.transpose(img_rgb, (2, 0, 1))
+
+    result = detector.single_image_detection(img_chw)
+    detections = _extract_detections(result)
 
     found_keep = False
     found_animal = False
-
-    for box in results.boxes:
-        conf = float(box.conf[0])
+    for label, conf in detections:
         if conf < CONFIDENCE_THRESHOLD:
             continue
-        cls_id = int(box.cls[0])
-        cls_name = model.names[cls_id]
-
-        if cls_name in KEEP_CLASSES:
+        if label in KEEP_LABELS:
             found_keep = True
-        elif cls_name in ANIMAL_CLASSES:
+        elif label in ANIMAL_LABELS:
             found_animal = True
 
     if found_keep:
@@ -229,8 +263,6 @@ async def finalize_burst(context: ContextTypes.DEFAULT_TYPE, chat_id: int, items
         )
         return
 
-    # No frame in the burst showed a person/vehicle — decide each photo
-    # individually based on its own animal/uncertain classification.
     for msg_id, decision in items:
         should_delete = decision == "delete" or (decision == "uncertain" and not KEEP_ON_UNCERTAIN)
         if should_delete:
@@ -272,7 +304,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not message or not message.photo:
         return
 
-    # Highest-resolution version of the photo
     photo = message.photo[-1]
     file = await context.bot.get_file(photo.file_id)
 
@@ -317,9 +348,6 @@ def main() -> None:
             "or set the TELEGRAM_BOT_TOKEN environment variable."
         )
 
-    # Longer timeouts than the library default reduce occasional "TimedOut"
-    # errors when downloading larger photos or on a slow connection between
-    # Railway and Telegram's file servers.
     request = HTTPXRequest(connect_timeout=15.0, read_timeout=30.0, write_timeout=15.0)
 
     app = Application.builder().token(BOT_TOKEN).request(request).build()
