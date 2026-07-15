@@ -13,8 +13,14 @@ Watches a Telegram group/channel it's an admin of. When a photo is posted:
     typically send 2 images per motion event) and waits briefly for the
     rest of the burst before acting — see BURST_WINDOW_SECONDS/MAX_BURST_SIZE.
   - If ANY photo in a burst shows a person or vehicle -> the WHOLE burst is
-    kept. If NO photo in the burst shows a person/vehicle -> every photo in
-    the burst is deleted.
+    provisionally kept. If NO photo in the burst shows a person/vehicle ->
+    every photo in the burst is deleted.
+  - On top of that, kept bursts go through a rolling dedupe window
+    (DEDUPE_WINDOW_SECONDS): if another kept burst for the same chat lands
+    within that window of the last one, only the higher-confidence burst
+    is left standing — the other is deleted. The window keeps rolling
+    forward on every new kept burst, so a continuous run of activity stays
+    suppressed to a single best photo until there's a gap of silence.
   - Tracks daily counts (received / kept / deleted) and posts a summary once
     a day — see DAILY_SUMMARY_HOUR_UTC below.
 
@@ -34,6 +40,7 @@ import asyncio
 import logging
 import os
 import tempfile
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import time as dt_time
 
@@ -67,8 +74,18 @@ ENHANCE_IMAGES = True
 ENHANCE_DENOISE = False
 
 # --- Multi-frame burst confirmation -----------------------------------------
+# Cameras here typically fire 2 images per motion event; group photos that
+# arrive close together and decide on the whole group at once.
 BURST_WINDOW_SECONDS = 4.0
 MAX_BURST_SIZE = 2
+
+# --- Rolling dedupe window for kept (human/vehicle) bursts -------------------
+# If another kept burst lands within this many seconds of the last one (for
+# the same chat), only the higher-confidence burst is kept — the other is
+# deleted. The window rolls forward on every new kept burst, so a continuous
+# run of activity is suppressed down to a single best photo. Set to 0 to
+# disable this behavior entirely.
+DEDUPE_WINDOW_SECONDS = int(os.environ.get("DEDUPE_WINDOW_SECONDS", str(5 * 60)))
 
 # --- Health check -----------------------------------------------------------
 _health_check_chat_id_raw = os.environ.get("HEALTH_CHECK_CHAT_ID", "-1002504583469")
@@ -108,6 +125,10 @@ _inference_executor = ThreadPoolExecutor(max_workers=1)
 
 _pending_bursts: dict = {}
 _pending_lock = asyncio.Lock()
+
+# Rolling dedupe state per chat: {"msg_ids": [...], "confidence": float, "timestamp": float}
+_recent_keeps: dict = {}
+_recent_keep_lock = asyncio.Lock()
 
 # Daily counters — reset after each digest is sent. Only ever touched from
 # the asyncio event loop (no await between read and write), so plain ints
@@ -179,9 +200,11 @@ def _extract_detections(result):
     return pairs
 
 
-def classify_image(image_path: str) -> str:
+def classify_image(image_path: str):
     """
-    Synchronous, CPU-bound. Returns one of: "keep", "delete", "uncertain".
+    Synchronous, CPU-bound. Returns a (decision, confidence) tuple, where
+    decision is one of: "keep", "delete", "uncertain". confidence is the
+    strongest matching detection's confidence (0.0 for "uncertain").
     Called via the thread pool executor — do not call directly from the
     event loop.
     """
@@ -193,7 +216,7 @@ def classify_image(image_path: str) -> str:
         img_bgr = cv2.imread(detection_input)
         if img_bgr is None:
             logger.warning("Could not read image for detection: %s", detection_input)
-            return "uncertain"
+            return "uncertain", 0.0
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
 
     # Pass the array in standard (height, width, channels) order — this is
@@ -203,56 +226,143 @@ def classify_image(image_path: str) -> str:
 
     found_keep = False
     found_animal = False
+    keep_confidence = 0.0
+    animal_confidence = 0.0
+
     for label, conf in detections:
         if conf < CONFIDENCE_THRESHOLD:
             continue
         if label in KEEP_LABELS:
             found_keep = True
+            keep_confidence = max(keep_confidence, conf)
         elif label in ANIMAL_LABELS:
             found_animal = True
+            animal_confidence = max(animal_confidence, conf)
 
     if found_keep:
-        return "keep"
+        return "keep", keep_confidence
     if found_animal:
-        return "delete"
-    return "uncertain"
+        return "delete", animal_confidence
+    return "uncertain", 0.0
 
 
-async def classify_image_async(image_path: str) -> str:
+async def classify_image_async(image_path: str):
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(_inference_executor, classify_image, image_path)
 
 
-async def finalize_burst(context: ContextTypes.DEFAULT_TYPE, chat_id: int, items: list) -> None:
-    decisions = [d for _, d in items]
-    msg_ids = [m for m, _ in items]
+async def _delete_messages(context: ContextTypes.DEFAULT_TYPE, chat_id: int, msg_ids: list, reason: str) -> int:
+    """Deletes each message id, logging + counting successes. Returns count deleted."""
+    deleted_count = 0
+    for msg_id in msg_ids:
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
+            deleted_count += 1
+            logger.info("Deleted photo (%s) (chat %s, msg %s)", reason, chat_id, msg_id)
+        except Exception as exc:
+            logger.warning(
+                "Failed to delete message %s in chat %s: %s. "
+                "Check the bot has admin + 'Delete Messages' rights.",
+                msg_id, chat_id, exc,
+            )
+    return deleted_count
 
-    if "keep" in decisions:
-        _stats["kept"] += len(items)
+
+async def resolve_keep_with_dedupe(
+    context: ContextTypes.DEFAULT_TYPE, chat_id: int, new_msg_ids: list, new_confidence: float
+) -> None:
+    """
+    Applies the rolling dedupe window on top of a provisionally-kept burst.
+    If a previously-kept burst for this chat is still within the dedupe
+    window, only the higher-confidence one survives; the loser is deleted.
+    The window always rolls forward to "now" on every new kept burst.
+    """
+    if DEDUPE_WINDOW_SECONDS <= 0:
+        _stats["kept"] += len(new_msg_ids)
         logger.info(
             "Kept burst of %d photo(s) with human/vehicle detected in at least one frame "
-            "(chat %s, msgs %s)",
-            len(items), chat_id, msg_ids,
+            "(chat %s, msgs %s, confidence=%.2f)",
+            len(new_msg_ids), chat_id, new_msg_ids, new_confidence,
         )
         return
 
-    for msg_id, decision in items:
+    now = time.monotonic()
+
+    async with _recent_keep_lock:
+        record = _recent_keeps.get(chat_id)
+        window_active = record is not None and (now - record["timestamp"]) < DEDUPE_WINDOW_SECONDS
+
+        if window_active and record["confidence"] >= new_confidence:
+            # Existing kept photo(s) are equal-or-better confidence — the new
+            # burst loses and gets deleted. Roll the window forward anyway.
+            outcome = "new_superseded"
+            to_delete = new_msg_ids
+            _recent_keeps[chat_id] = {
+                "msg_ids": record["msg_ids"],
+                "confidence": record["confidence"],
+                "timestamp": now,
+            }
+        else:
+            # New burst wins (or no active window) — it becomes the kept
+            # record; anything it replaces gets deleted.
+            outcome = "old_superseded" if window_active else "first_in_window"
+            to_delete = record["msg_ids"] if window_active else []
+            _recent_keeps[chat_id] = {
+                "msg_ids": new_msg_ids,
+                "confidence": new_confidence,
+                "timestamp": now,
+            }
+
+    if outcome == "new_superseded":
+        deleted = await _delete_messages(
+            context, chat_id, to_delete,
+            "duplicate human/vehicle detection within dedupe window; lower/equal confidence",
+        )
+        _stats["deleted"] += deleted
+        logger.info(
+            "New kept burst (chat %s, msgs %s, confidence=%.2f) superseded by an earlier, "
+            "higher-confidence photo within the %ds dedupe window — deleted.",
+            chat_id, new_msg_ids, new_confidence, DEDUPE_WINDOW_SECONDS,
+        )
+    else:
+        if outcome == "old_superseded":
+            deleted = await _delete_messages(
+                context, chat_id, to_delete,
+                "superseded by a higher-confidence duplicate within dedupe window",
+            )
+            _stats["kept"] = max(0, _stats["kept"] - deleted)
+            _stats["deleted"] += deleted
+            logger.info(
+                "Replaced previously kept photo(s) with a higher-confidence duplicate "
+                "within the %ds dedupe window (chat %s).",
+                DEDUPE_WINDOW_SECONDS, chat_id,
+            )
+
+        _stats["kept"] += len(new_msg_ids)
+        logger.info(
+            "Kept burst of %d photo(s) with human/vehicle detected in at least one frame "
+            "(chat %s, msgs %s, confidence=%.2f)",
+            len(new_msg_ids), chat_id, new_msg_ids, new_confidence,
+        )
+
+
+async def finalize_burst(context: ContextTypes.DEFAULT_TYPE, chat_id: int, items: list) -> None:
+    """items is a list of (msg_id, decision, confidence) tuples."""
+    decisions = [d for _, d, _ in items]
+    msg_ids = [m for m, _, _ in items]
+
+    if "keep" in decisions:
+        keep_confidence = max(c for _, d, c in items if d == "keep")
+        await resolve_keep_with_dedupe(context, chat_id, msg_ids, keep_confidence)
+        return
+
+    for msg_id, decision, _ in items:
         should_delete = decision == "delete" or (decision == "uncertain" and not KEEP_ON_UNCERTAIN)
         if should_delete:
-            try:
-                await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
-                _stats["deleted"] += 1
-                logger.info(
-                    "Deleted photo (burst-confirmed no human/vehicle; frame decision=%s) "
-                    "(chat %s, msg %s)",
-                    decision, chat_id, msg_id,
-                )
-            except Exception as exc:
-                logger.warning(
-                    "Failed to delete message %s in chat %s: %s. "
-                    "Check the bot has admin + 'Delete Messages' rights.",
-                    msg_id, chat_id, exc,
-                )
+            deleted = await _delete_messages(
+                context, chat_id, [msg_id], f"burst-confirmed no human/vehicle; frame decision={decision}"
+            )
+            _stats["deleted"] += deleted
         else:
             _stats["kept"] += 1
             logger.info(
@@ -286,14 +396,14 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     with tempfile.NamedTemporaryFile(suffix=".jpg", delete=True) as tmp:
         await file.download_to_drive(tmp.name)
-        decision = await classify_image_async(tmp.name)
+        decision, confidence = await classify_image_async(tmp.name)
 
     chat_id = message.chat_id
     msg_id = message.message_id
 
     async with _pending_lock:
         bucket = _pending_bursts.setdefault(chat_id, {"items": [], "timer": None})
-        bucket["items"].append((msg_id, decision))
+        bucket["items"].append((msg_id, decision, confidence))
 
         if bucket["timer"] is not None:
             bucket["timer"].cancel()
@@ -327,7 +437,7 @@ async def daily_summary_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         "📊 Daily Summary\n"
         f"Total images received: {received}\n"
         f"Classified as human/vehicle (kept): {kept}\n"
-        f"Filtered out as animal/empty (deleted): {deleted}"
+        f"Filtered out as animal/empty/duplicate (deleted): {deleted}"
     )
 
     try:
@@ -382,6 +492,15 @@ def main() -> None:
         )
     else:
         logger.info("Daily summary disabled (DAILY_SUMMARY_CHAT_ID not set)")
+
+    if DEDUPE_WINDOW_SECONDS > 0:
+        logger.info(
+            "Rolling dedupe enabled: kept photos within %ds of each other in the same "
+            "chat are collapsed down to the single highest-confidence photo.",
+            DEDUPE_WINDOW_SECONDS,
+        )
+    else:
+        logger.info("Rolling dedupe disabled (DEDUPE_WINDOW_SECONDS=0)")
 
     logger.info("Bot started. Polling for new photos...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
