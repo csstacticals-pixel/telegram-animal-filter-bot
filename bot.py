@@ -2,6 +2,8 @@
 Telegram Animal-Image Filter Bot
 ---------------------------------
 Watches a Telegram group/channel it's an admin of. When a photo is posted:
+  - Enhances the image internally (contrast/low-light correction) to help
+    the detector, without altering the photo actually left in the chat.
   - Runs it through a YOLOv8 object detector (in a background thread, so it
     never blocks the bot from handling other incoming photos concurrently).
   - Buffers photos that arrive close together into a "burst" (cameras here
@@ -15,7 +17,7 @@ Watches a Telegram group/channel it's an admin of. When a photo is posted:
     unclear) -> each photo in the burst is deleted per KEEP_ON_UNCERTAIN.
 
 No tagging/reply messages are sent — the bot only acts silently (deletes or
-leaves photos alone).
+leaves photos alone), aside from the periodic health-check heartbeat.
 
 Requires the bot to be added as an ADMIN with "Delete Messages" permission in the
 target chat. Telegram bots cannot read message history from before they joined,
@@ -31,6 +33,8 @@ import os
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
 
+import cv2
+import numpy as np
 from telegram import Update
 from telegram.ext import Application, MessageHandler, ContextTypes, filters
 from telegram.request import HTTPXRequest
@@ -72,6 +76,19 @@ ANIMAL_CLASSES = {
 # (blurry, empty, unclear), should it count as delete-eligible? False = also
 # delete empty/ambiguous photos alongside clear animal shots.
 KEEP_ON_UNCERTAIN = False
+
+# --- Image enhancement (for detection accuracy only) ------------------------
+# Camera-trap footage is often low-contrast, hazy, or dim (dawn/dusk/night).
+# When enabled, each photo is enhanced in memory before being handed to YOLO
+# — the photo left in the chat is untouched; only the copy used for detection
+# is enhanced.
+ENHANCE_IMAGES = True
+
+# Denoising (on top of contrast correction) further helps grainy/noisy night
+# shots, but is noticeably slower per photo. Off by default; turn on if
+# you're specifically missing detections in noisy/night footage and can
+# afford the extra processing time.
+ENHANCE_DENOISE = False
 
 # --- Multi-frame burst confirmation -----------------------------------------
 # Cameras here send photos in short bursts per motion event (commonly 2
@@ -130,15 +147,48 @@ _pending_bursts: dict = {}
 _pending_lock = asyncio.Lock()
 
 
+def enhance_image(image_path: str) -> np.ndarray:
+    """
+    Loads the image and applies CLAHE (contrast-limited adaptive histogram
+    equalization) on the luminance channel to correct for low-contrast,
+    hazy, or dim (dawn/dusk/night) shots — helps YOLO pick out subjects that
+    would otherwise blend into a washed-out or dark background. Optionally
+    denoises on top of that if ENHANCE_DENOISE is on.
+
+    Returns a numpy array (BGR) — YOLO accepts arrays directly, no need to
+    write the enhanced version back to disk.
+    """
+    img = cv2.imread(image_path)
+    if img is None:
+        # Fall back to letting YOLO read the original file directly.
+        return image_path
+
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+    l_channel, a_channel, b_channel = cv2.split(lab)
+
+    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+    l_enhanced = clahe.apply(l_channel)
+
+    lab_enhanced = cv2.merge((l_enhanced, a_channel, b_channel))
+    enhanced = cv2.cvtColor(lab_enhanced, cv2.COLOR_LAB2BGR)
+
+    if ENHANCE_DENOISE:
+        enhanced = cv2.fastNlMeansDenoisingColored(enhanced, None, 5, 5, 7, 21)
+
+    return enhanced
+
+
 def classify_image(image_path: str) -> str:
     """
     Synchronous, CPU-bound. Returns one of: "keep", "delete", "uncertain".
     Called via the thread pool executor — do not call directly from the
     event loop.
     """
+    detection_input = enhance_image(image_path) if ENHANCE_IMAGES else image_path
+
     # imgsz=1280 (up from the default 640) runs inference at higher resolution,
     # which meaningfully helps detect small/distant subjects.
-    results = model(image_path, imgsz=1280, verbose=False)[0]
+    results = model(detection_input, imgsz=1280, verbose=False)[0]
 
     found_keep = False
     found_animal = False
