@@ -6,9 +6,7 @@ Watches a Telegram group/channel it's an admin of. When a photo is posted:
     the detector, without altering the photo actually left in the chat.
   - Runs it through MegaDetectorV6 (PytorchWildlife) — a detector built
     specifically for camera-trap imagery, with a generic 3-class taxonomy:
-    animal / person / vehicle. Unlike a general COCO model, it doesn't need
-    to recognize specific species (oryx, springbok, kudu, etc.) — anything
-    non-human/non-vehicle just falls under "animal".
+    animal / person / vehicle.
   - Runs inference in a background thread (never blocks the bot from
     handling other incoming photos concurrently).
   - Buffers photos that arrive close together into a "burst" (cameras here
@@ -17,9 +15,12 @@ Watches a Telegram group/channel it's an admin of. When a photo is posted:
   - If ANY photo in a burst shows a person or vehicle -> the WHOLE burst is
     kept. If NO photo in the burst shows a person/vehicle -> every photo in
     the burst is deleted.
+  - Tracks daily counts (received / kept / deleted) and posts a summary once
+    a day — see DAILY_SUMMARY_HOUR_UTC below.
 
-No tagging/reply messages are sent — the bot only acts silently (deletes or
-leaves photos alone), aside from the periodic health-check heartbeat.
+No per-photo tagging/reply messages are sent — the bot only acts silently
+(deletes or leaves photos alone), aside from the health-check heartbeat and
+the daily summary.
 
 Requires the bot to be added as an ADMIN with "Delete Messages" permission in
 the target chat. Telegram bots cannot read message history from before they
@@ -34,6 +35,7 @@ import logging
 import os
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
+from datetime import time as dt_time
 
 import cv2
 import numpy as np
@@ -49,9 +51,7 @@ from PytorchWildlife.models import detection as pw_detection
 # Get this from @BotFather after running /newbot
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "PASTE_YOUR_BOT_TOKEN_HERE")
 
-# MegaDetectorV6 version. "MDV6-yolov10-c" is the smallest/fastest variant
-# (2.3M params, no NMS post-processing step) — chosen here to keep
-# per-photo processing quick.
+# MegaDetectorV6 version. "MDV6-yolov10-c" is the smallest/fastest variant.
 MEGADETECTOR_VERSION = "MDV6-yolov10-c"
 
 # Minimum confidence to trust a detection.
@@ -76,6 +76,17 @@ HEALTH_CHECK_CHAT_ID = int(_health_check_chat_id_raw) if _health_check_chat_id_r
 HEALTH_CHECK_INTERVAL_SECONDS = 6 * 60 * 60  # every 6 hours
 HEALTH_CHECK_MESSAGE = "🟢 AI running"
 
+# --- Daily summary digest ----------------------------------------------------
+# Posts one message per day with counts of everything the bot processed.
+# Reuses HEALTH_CHECK_CHAT_ID by default (same monitored group) — override
+# with DAILY_SUMMARY_CHAT_ID if you want it posted somewhere else instead.
+_daily_summary_chat_id_raw = os.environ.get("DAILY_SUMMARY_CHAT_ID", _health_check_chat_id_raw)
+DAILY_SUMMARY_CHAT_ID = int(_daily_summary_chat_id_raw) if _daily_summary_chat_id_raw else None
+
+# What time (UTC) to post the digest. Default 06:00 UTC — adjust to your
+# rangers' shift start via the DAILY_SUMMARY_HOUR_UTC env var if needed.
+DAILY_SUMMARY_HOUR_UTC = int(os.environ.get("DAILY_SUMMARY_HOUR_UTC", "6"))
+
 # ---------------------------------------------------------------------------
 
 logging.basicConfig(
@@ -97,6 +108,15 @@ _inference_executor = ThreadPoolExecutor(max_workers=1)
 
 _pending_bursts: dict = {}
 _pending_lock = asyncio.Lock()
+
+# Daily counters — reset after each digest is sent. Only ever touched from
+# the asyncio event loop (no await between read and write), so plain ints
+# are safe without an extra lock.
+_stats = {
+    "received": 0,
+    "kept": 0,
+    "deleted": 0,
+}
 
 
 def enhance_image(image_path: str):
@@ -177,10 +197,7 @@ def classify_image(image_path: str) -> str:
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
 
     # Pass the array in standard (height, width, channels) order — this is
-    # an Ultralytics-backed model under the hood, which expects HWC, not
-    # the channels-first (3, H, W) shape shown in PytorchWildlife's
-    # smoke-test demo snippet. Passing CHW here previously caused the model
-    # to see scrambled pixel data and return zero detections on everything.
+    # an Ultralytics-backed model under the hood, which expects HWC.
     result = detector.single_image_detection(img_rgb)
     detections = _extract_detections(result)
 
@@ -211,6 +228,7 @@ async def finalize_burst(context: ContextTypes.DEFAULT_TYPE, chat_id: int, items
     msg_ids = [m for m, _ in items]
 
     if "keep" in decisions:
+        _stats["kept"] += len(items)
         logger.info(
             "Kept burst of %d photo(s) with human/vehicle detected in at least one frame "
             "(chat %s, msgs %s)",
@@ -223,6 +241,7 @@ async def finalize_burst(context: ContextTypes.DEFAULT_TYPE, chat_id: int, items
         if should_delete:
             try:
                 await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
+                _stats["deleted"] += 1
                 logger.info(
                     "Deleted photo (burst-confirmed no human/vehicle; frame decision=%s) "
                     "(chat %s, msg %s)",
@@ -235,6 +254,7 @@ async def finalize_burst(context: ContextTypes.DEFAULT_TYPE, chat_id: int, items
                     msg_id, chat_id, exc,
                 )
         else:
+            _stats["kept"] += 1
             logger.info(
                 "Kept photo (uncertain, KEEP_ON_UNCERTAIN=True) (chat %s, msg %s)",
                 chat_id, msg_id,
@@ -258,6 +278,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     message = update.effective_message
     if not message or not message.photo:
         return
+
+    _stats["received"] += 1
 
     photo = message.photo[-1]
     file = await context.bot.get_file(photo.file_id)
@@ -296,6 +318,34 @@ async def health_check_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.warning("Failed to send health check to chat %s: %s", HEALTH_CHECK_CHAT_ID, exc)
 
 
+async def daily_summary_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    received = _stats["received"]
+    kept = _stats["kept"]
+    deleted = _stats["deleted"]
+
+    text = (
+        "📊 Daily Summary\n"
+        f"Total images received: {received}\n"
+        f"Classified as human/vehicle (kept): {kept}\n"
+        f"Filtered out as animal/empty (deleted): {deleted}"
+    )
+
+    try:
+        await context.bot.send_message(chat_id=DAILY_SUMMARY_CHAT_ID, text=text)
+        logger.info(
+            "Daily summary sent to chat %s (received=%d, kept=%d, deleted=%d)",
+            DAILY_SUMMARY_CHAT_ID, received, kept, deleted,
+        )
+    except Exception as exc:
+        logger.warning("Failed to send daily summary to chat %s: %s", DAILY_SUMMARY_CHAT_ID, exc)
+
+    # Reset for the next day regardless of whether the send succeeded, so a
+    # transient failure doesn't cause double-counting into tomorrow's report.
+    _stats["received"] = 0
+    _stats["kept"] = 0
+    _stats["deleted"] = 0
+
+
 def main() -> None:
     if BOT_TOKEN == "PASTE_YOUR_BOT_TOKEN_HERE":
         raise SystemExit(
@@ -320,6 +370,18 @@ def main() -> None:
         )
     else:
         logger.info("Health check disabled (HEALTH_CHECK_CHAT_ID not set)")
+
+    if DAILY_SUMMARY_CHAT_ID:
+        app.job_queue.run_daily(
+            daily_summary_job,
+            time=dt_time(hour=DAILY_SUMMARY_HOUR_UTC, minute=0),
+        )
+        logger.info(
+            "Daily summary enabled: posting to chat %s at %02d:00 UTC",
+            DAILY_SUMMARY_CHAT_ID, DAILY_SUMMARY_HOUR_UTC,
+        )
+    else:
+        logger.info("Daily summary disabled (DAILY_SUMMARY_CHAT_ID not set)")
 
     logger.info("Bot started. Polling for new photos...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
