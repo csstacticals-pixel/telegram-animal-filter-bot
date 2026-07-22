@@ -3,3 +3,4 @@ PytorchWildlife==1.2.4
 numpy
 setuptools==69.5.1
 telethon
+cryptg
