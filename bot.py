@@ -532,7 +532,28 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def handle_userbot_photo(event) -> None:
     """Telethon entry point — sees photos posted by OTHER bots (e.g. the
-    Google Apps Script relay bot), which the Bot API side can never see."""
+    Google Apps Script relay bot), which the Bot API side can never see.
+
+    Registered WITHOUT a chats= filter on purpose: Telethon's internal chat-ID
+    representation doesn't always match the "-100..." form the Bot API uses
+    for the same chat, and if a chats= filter doesn't match, the handler
+    silently never fires at all (no error, nothing in the logs). Filtering
+    manually here instead means a mismatch is loud and diagnosable rather
+    than silent.
+    """
+    chat_id = event.chat_id
+
+    if USERBOT_CHAT_ID is not None and chat_id != USERBOT_CHAT_ID:
+        if event.photo:
+            chat_title = getattr(event.chat, "title", None)
+            logger.info(
+                "Userbot saw a photo in a chat that doesn't match USERBOT_CHAT_ID "
+                "(configured=%s, actual=%s, chat_title=%r). If %r is actually the "
+                "intended group, set USERBOT_CHAT_ID=%s and redeploy.",
+                USERBOT_CHAT_ID, chat_id, chat_title, chat_title, chat_id,
+            )
+        return
+
     if not event.photo:
         return
 
@@ -671,7 +692,11 @@ async def run_bot() -> None:
         userbot_client = TelegramClient(
             StringSession(TELETHON_SESSION_STRING), TELETHON_API_ID, TELETHON_API_HASH
         )
-        userbot_client.add_event_handler(handle_userbot_photo, events.NewMessage(chats=USERBOT_CHAT_ID))
+        # No chats= filter here on purpose — see handle_userbot_photo's
+        # docstring for why. The chat match is done manually inside the
+        # handler instead, so a chat-ID mismatch is visible in the logs
+        # rather than silently dropping every event.
+        userbot_client.add_event_handler(handle_userbot_photo, events.NewMessage())
         await userbot_client.start()
         me = await userbot_client.get_me()
         logger.info(
