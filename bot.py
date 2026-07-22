@@ -16,10 +16,17 @@ so our filter bot would otherwise never see them at all — not a detection
 bug, a hard platform restriction. The Telethon listener, running as a normal
 user account, has no such restriction and sees everything; it hands off
 detected photos into the exact same classify -> burst -> dedupe pipeline.
-Deletion always goes through the main Bot API bot (which already holds
-admin + Delete Messages rights), regardless of which listener spotted the
-photo — the userbot account itself needs no special permissions, just
-group membership.
+
+Deletion routing: the same bot-isolation restriction that blocks a bot from
+SEEING another bot's messages also appears to block it from being able to
+DELETE one (Telegram's deleteMessage returned "message not found" 100% of
+the time for Apps-Script-bot-authored photos, even with admin + Delete
+Messages rights, while deletes of human-authored photos always succeeded).
+So deletion is routed by whichever listener originally spotted the photo:
+photos seen by the main Bot API bot are deleted by that bot; photos seen by
+the Telethon userbot are deleted by the userbot account itself. The userbot
+account therefore needs its own admin + Delete Messages rights in the group
+(no longer just plain membership).
 
 Everything below the two entry points (handle_photo for the Bot API side,
 handle_userbot_photo for the Telethon side) is shared, unchanged pipeline
@@ -119,10 +126,10 @@ DAILY_SUMMARY_HOUR_UTC = int(os.environ.get("DAILY_SUMMARY_HOUR_UTC", "6"))
 # free, at https://my.telegram.org (API Development Tools). Generate
 # TELETHON_SESSION_STRING once via the separate generate_telethon_session.py
 # helper script, run locally/interactively (never on Railway) — see that
-# script's docstring for the one-time login steps. The account used only
-# needs to be a member of the monitored group; it never deletes anything
-# itself — all deletions go through the main bot, which already holds
-# admin + Delete Messages rights.
+# script's docstring for the one-time login steps. The account used needs
+# its own admin + Delete Messages rights in the monitored group: it deletes
+# the photos it detects itself, since the main bot cannot delete messages
+# authored by another bot even with admin rights (see module docstring).
 TELETHON_API_ID = int(os.environ.get("TELETHON_API_ID", "0") or 0)
 TELETHON_API_HASH = os.environ.get("TELETHON_API_HASH", "")
 TELETHON_SESSION_STRING = os.environ.get("TELETHON_SESSION_STRING", "")
@@ -175,9 +182,11 @@ _stats = {
     "deleted": 0,
 }
 
-# Set once the main bot is up, so the Telethon listener (a separate client)
-# can perform deletions through the SAME Bot API bot that holds admin rights.
+# Set once each client is up. Deletion is routed by which listener spotted
+# the photo: _ptb_bot_ref deletes Bot-API-seen (human) photos, _userbot_client_ref
+# deletes Telethon-seen (other-bot) photos — see module docstring for why.
 _ptb_bot_ref = None
+_userbot_client_ref = None
 
 _DATE_TIME_PATTERN = re.compile(
     r"\d{4}-\d{2}-\d{2}"
@@ -335,31 +344,57 @@ async def classify_image_async(image_path: str):
     return await loop.run_in_executor(_inference_executor, classify_image, image_path)
 
 
-async def _delete_messages(bot, chat_id: int, msg_ids: list, reason: str) -> int:
-    """Deletes each message id via the main Bot API bot, regardless of which
-    listener (PTB or Telethon) originally spotted the photo."""
+async def _delete_one(chat_id: int, msg_id: int, listener: str) -> bool:
+    """Deletes a single message using whichever client actually SAW it.
+    Photos spotted by the main Bot API bot are deleted by that bot; photos
+    spotted by the Telethon userbot are deleted by the userbot account
+    itself. Mixing these up is exactly what caused the "message to delete
+    not found" failures seen on every Apps-Script-bot-authored photo — the
+    main bot appears unable to delete a message it was never shown, even
+    with admin + Delete Messages rights."""
+    try:
+        if listener == "userbot":
+            if _userbot_client_ref is None:
+                logger.warning(
+                    "Cannot delete msg %s in chat %s via userbot: userbot client not ready. "
+                    "Falling back to the main bot (may fail with 'not found').",
+                    msg_id, chat_id,
+                )
+                await _ptb_bot_ref.delete_message(chat_id=chat_id, message_id=msg_id)
+            else:
+                await _userbot_client_ref.delete_messages(chat_id, msg_id, revoke=True)
+        else:
+            await _ptb_bot_ref.delete_message(chat_id=chat_id, message_id=msg_id)
+        return True
+    except Exception as exc:
+        logger.warning(
+            "Failed to delete message %s in chat %s (via %s): %s. "
+            "Check that account has admin + 'Delete Messages' rights.",
+            msg_id, chat_id, listener, exc,
+        )
+        return False
+
+
+async def _delete_messages(chat_id: int, items: list, reason: str) -> int:
+    """items is a list of (msg_id, listener) tuples."""
     deleted_count = 0
-    for msg_id in msg_ids:
-        try:
-            await bot.delete_message(chat_id=chat_id, message_id=msg_id)
+    for msg_id, listener in items:
+        if await _delete_one(chat_id, msg_id, listener):
             deleted_count += 1
-            logger.info("Deleted photo (%s) (chat %s, msg %s)", reason, chat_id, msg_id)
-        except Exception as exc:
-            logger.warning(
-                "Failed to delete message %s in chat %s: %s. "
-                "Check the bot has admin + 'Delete Messages' rights.",
-                msg_id, chat_id, exc,
-            )
+            logger.info("Deleted photo (%s) (chat %s, msg %s, via %s)", reason, chat_id, msg_id, listener)
     return deleted_count
 
 
-async def resolve_keep_with_dedupe(bot, chat_id: int, new_msg_ids: list, new_confidence: float, new_hash, new_source_key) -> None:
+async def resolve_keep_with_dedupe(chat_id: int, new_items: list, new_confidence: float, new_hash, new_source_key) -> None:
+    """new_items is a list of (msg_id, listener) tuples for this kept burst."""
+    new_msg_ids = [m for m, _ in new_items]
+
     if DEDUPE_WINDOW_SECONDS <= 0:
-        _stats["kept"] += len(new_msg_ids)
+        _stats["kept"] += len(new_items)
         logger.info(
             "Kept burst of %d photo(s) with human/vehicle detected in at least one frame "
             "(chat %s, msgs %s, confidence=%.2f)",
-            len(new_msg_ids), chat_id, new_msg_ids, new_confidence,
+            len(new_items), chat_id, new_msg_ids, new_confidence,
         )
         return
 
@@ -383,7 +418,7 @@ async def resolve_keep_with_dedupe(bot, chat_id: int, new_msg_ids: list, new_con
 
         if should_merge and record["confidence"] >= new_confidence:
             outcome = "new_superseded"
-            to_delete = new_msg_ids
+            to_delete = new_items
             _recent_keeps[chat_id] = {
                 "msg_ids": record["msg_ids"], "confidence": record["confidence"],
                 "timestamp": now, "hash": record["hash"], "source_key": old_source,
@@ -392,20 +427,20 @@ async def resolve_keep_with_dedupe(bot, chat_id: int, new_msg_ids: list, new_con
             outcome = "old_superseded"
             to_delete = record["msg_ids"]
             _recent_keeps[chat_id] = {
-                "msg_ids": new_msg_ids, "confidence": new_confidence,
+                "msg_ids": new_items, "confidence": new_confidence,
                 "timestamp": now, "hash": new_hash, "source_key": new_source_key,
             }
         else:
             outcome = "distinct_event" if window_active else "first_in_window"
             to_delete = []
             _recent_keeps[chat_id] = {
-                "msg_ids": new_msg_ids, "confidence": new_confidence,
+                "msg_ids": new_items, "confidence": new_confidence,
                 "timestamp": now, "hash": new_hash, "source_key": new_source_key,
             }
 
     if outcome == "new_superseded":
         deleted = await _delete_messages(
-            bot, chat_id, to_delete,
+            chat_id, to_delete,
             "duplicate human/vehicle detection within dedupe window; same scene/source, lower/equal confidence",
         )
         _stats["deleted"] += deleted
@@ -419,7 +454,7 @@ async def resolve_keep_with_dedupe(bot, chat_id: int, new_msg_ids: list, new_con
 
     if outcome == "old_superseded":
         deleted = await _delete_messages(
-            bot, chat_id, to_delete,
+            chat_id, to_delete,
             "superseded by a higher-confidence duplicate of the same scene/source within dedupe window",
         )
         _stats["kept"] = max(0, _stats["kept"] - deleted)
@@ -438,32 +473,32 @@ async def resolve_keep_with_dedupe(bot, chat_id: int, new_msg_ids: list, new_con
             chat_id, new_msg_ids, DEDUPE_WINDOW_SECONDS, distance, SIMILARITY_HAMMING_THRESHOLD, same_source,
         )
 
-    _stats["kept"] += len(new_msg_ids)
+    _stats["kept"] += len(new_items)
     logger.info(
         "Kept burst of %d photo(s) with human/vehicle detected in at least one frame "
         "(chat %s, msgs %s, confidence=%.2f)",
-        len(new_msg_ids), chat_id, new_msg_ids, new_confidence,
+        len(new_items), chat_id, new_msg_ids, new_confidence,
     )
 
 
-async def finalize_burst(bot, chat_id: int, items: list) -> None:
-    """items is a list of (msg_id, decision, confidence, image_hash, source_key) tuples."""
-    decisions = [d for _, d, _, _, _ in items]
-    msg_ids = [m for m, _, _, _, _ in items]
+async def finalize_burst(chat_id: int, items: list) -> None:
+    """items is a list of (msg_id, decision, confidence, image_hash, source_key, listener) tuples."""
+    decisions = [d for _, d, _, _, _, _ in items]
 
     if "keep" in decisions:
-        keep_items = [(m, c, h, s) for m, d, c, h, s in items if d == "keep"]
-        _, keep_confidence, keep_hash, keep_source = max(keep_items, key=lambda t: t[1])
+        keep_items = [(m, c, h, s, l) for m, d, c, h, s, l in items if d == "keep"]
+        _, keep_confidence, keep_hash, keep_source, _ = max(keep_items, key=lambda t: t[1])
         if not keep_source:
-            keep_source = next((s for (_, _, _, s) in keep_items if s), None)
-        await resolve_keep_with_dedupe(bot, chat_id, msg_ids, keep_confidence, keep_hash, keep_source)
+            keep_source = next((s for (_, _, _, s, _) in keep_items if s), None)
+        keep_msg_items = [(m, l) for m, _, _, _, l in keep_items]
+        await resolve_keep_with_dedupe(chat_id, keep_msg_items, keep_confidence, keep_hash, keep_source)
         return
 
-    for msg_id, decision, _, _, _ in items:
+    for msg_id, decision, _, _, _, listener in items:
         should_delete = decision == "delete" or (decision == "uncertain" and not KEEP_ON_UNCERTAIN)
         if should_delete:
             deleted = await _delete_messages(
-                bot, chat_id, [msg_id], f"burst-confirmed no human/vehicle; frame decision={decision}"
+                chat_id, [(msg_id, listener)], f"burst-confirmed no human/vehicle; frame decision={decision}"
             )
             _stats["deleted"] += deleted
         else:
@@ -471,7 +506,7 @@ async def finalize_burst(bot, chat_id: int, items: list) -> None:
             logger.info("Kept photo (uncertain, KEEP_ON_UNCERTAIN=True) (chat %s, msg %s)", chat_id, msg_id)
 
 
-async def _finalize_after_delay(bot, chat_id: int) -> None:
+async def _finalize_after_delay(chat_id: int) -> None:
     try:
         await asyncio.sleep(BURST_WINDOW_SECONDS)
     except asyncio.CancelledError:
@@ -481,16 +516,18 @@ async def _finalize_after_delay(bot, chat_id: int) -> None:
         bucket = _pending_bursts.pop(chat_id, None)
 
     if bucket and bucket["items"]:
-        await finalize_burst(bot, chat_id, bucket["items"])
+        await finalize_burst(chat_id, bucket["items"])
 
 
-async def _ingest_classified_photo(bot, chat_id: int, msg_id: int, decision: str, confidence: float, image_hash, source_key) -> None:
+async def _ingest_classified_photo(chat_id: int, msg_id: int, decision: str, confidence: float, image_hash, source_key, listener: str) -> None:
     """Shared burst-bucketing logic used by BOTH the Bot API photo handler
     and the Telethon userbot listener, so a photo is treated identically no
-    matter which listener spotted it."""
+    matter which listener spotted it. `listener` ("bot" or "userbot") is
+    carried through so the eventual delete call uses the client that can
+    actually see/act on that specific message."""
     async with _pending_lock:
         bucket = _pending_bursts.setdefault(chat_id, {"items": [], "timer": None})
-        bucket["items"].append((msg_id, decision, confidence, image_hash, source_key))
+        bucket["items"].append((msg_id, decision, confidence, image_hash, source_key, listener))
 
         if bucket["timer"] is not None:
             bucket["timer"].cancel()
@@ -500,11 +537,11 @@ async def _ingest_classified_photo(bot, chat_id: int, msg_id: int, decision: str
             del _pending_bursts[chat_id]
             finalize_now = True
         else:
-            bucket["timer"] = asyncio.create_task(_finalize_after_delay(bot, chat_id))
+            bucket["timer"] = asyncio.create_task(_finalize_after_delay(chat_id))
             finalize_now = False
 
     if finalize_now:
-        await finalize_burst(bot, chat_id, items)
+        await finalize_burst(chat_id, items)
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -526,7 +563,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     source_key = caption_source_key or ocr_source_key
 
     await _ingest_classified_photo(
-        context.bot, message.chat_id, message.message_id, decision, confidence, image_hash, source_key
+        message.chat_id, message.message_id, decision, confidence, image_hash, source_key, listener="bot"
     )
 
 
@@ -587,7 +624,7 @@ async def handle_userbot_photo(event) -> None:
     source_key = caption_source_key or ocr_source_key
 
     await _ingest_classified_photo(
-        _ptb_bot_ref, event.chat_id, event.message.id, decision, confidence, image_hash, source_key
+        event.chat_id, event.message.id, decision, confidence, image_hash, source_key, listener="userbot"
     )
 
 
@@ -626,7 +663,7 @@ async def daily_summary_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def run_bot() -> None:
-    global _ptb_bot_ref
+    global _ptb_bot_ref, _userbot_client_ref
 
     if BOT_TOKEN == "PASTE_YOUR_BOT_TOKEN_HERE":
         raise SystemExit(
@@ -698,9 +735,12 @@ async def run_bot() -> None:
         # rather than silently dropping every event.
         userbot_client.add_event_handler(handle_userbot_photo, events.NewMessage())
         await userbot_client.start()
+        _userbot_client_ref = userbot_client
         me = await userbot_client.get_me()
         logger.info(
-            "Userbot listener active as %s (id=%s), watching chat %s for photos posted by OTHER bots.",
+            "Userbot listener active as %s (id=%s), watching chat %s for photos posted by OTHER bots. "
+            "Deletions of those photos will be performed by this account directly (requires admin + "
+            "Delete Messages rights in the group).",
             getattr(me, "username", None) or getattr(me, "first_name", "unknown"), me.id, USERBOT_CHAT_ID,
         )
     else:
